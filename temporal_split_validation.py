@@ -25,7 +25,7 @@ def _(requests):
 
     query_ls = []
     query_ls.append(" OR ".join([f"GO_{ec}:*" for ec in valid_evidence_codes])) 
-    query_ls.append("taxonomy_id:")
+    #query_ls.append(" OR ".join([f"taxonomy_id:{tax_id}" for tax_id in valid_taxa]))
     query_ls.append(f"date_modified:[* TO 2025-06-18]")
     query_ls.append("reviewed:true") # Swiss-Prot only
 
@@ -116,6 +116,11 @@ def _(pl):
 
 
 @app.cell
+def _():
+    return
+
+
+@app.cell
 def _(pl, raw_data, test_taxon_df, train_terms, valid_evidence_codes):
     # Function to parse the UniProt JSON structure
     def extract_go_terms(data, valid_codes, valid_taxons):
@@ -192,6 +197,12 @@ def _():
 @app.cell
 def _(additional_terms_df):
     additional_terms_df
+    return
+
+
+@app.cell
+def _(test_taxon_df):
+    test_taxon_df.select("ID").write_csv("taxon_ids.txt", include_header=False)
     return
 
 

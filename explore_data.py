@@ -12,52 +12,20 @@ def _():
     import marimo as mo
     import torch
     import numpy as np
-    return SeqIO, mo, np, p9, pl, torch
+    from utils import data
+    return data, mo, np, p9, pl, torch
 
 
 @app.cell
-def _(SeqIO, pl):
-    def create_train_df(fasta_path="dataset/Train/train_sequences.fasta", taxon_file="dataset/Train/train_taxonomy.tsv"):
-        data = [
-            (*record.id.split("|", 2), str(record.seq))
-            for record in SeqIO.parse(fasta_path, "fasta")
-        ]
-
-        train_df = pl.DataFrame(
-            data, 
-            schema=["db", "protein_id", "gene_name", "sequence"],
-            orient="row"
-        )
-
-        train_taxons_df = pl.read_csv(taxon_file, separator="\t", has_header=False).rename({"column_1": "protein_id", "column_2": "taxon_id"})
-
-        return train_df.join(train_taxons_df, on="protein_id")
-
-    train_df = create_train_df()
+def _(data):
+    train_df = data.create_train_df()
     train_df
     return (train_df,)
 
 
 @app.cell
-def _(SeqIO, pl):
-    def create_test_df(fasta_path="dataset/Test/testsuperset.fasta"):
-
-        data = [
-            (*record.description.split(" ", 1), str(record.seq))
-            for record in SeqIO.parse(fasta_path, "fasta")
-        ]
-
-        return pl.DataFrame(
-            data,
-            schema=[
-                ("protein_id", pl.Utf8),
-                ("taxon_id", pl.Int64),
-                ("sequence", pl.Utf8),
-            ],
-            orient="row"
-        )
-
-    test_df = create_test_df()
+def _(data):
+    test_df = data.create_test_df()
     test_df
     return (test_df,)
 
@@ -385,7 +353,7 @@ def _(np, pl, test_esmc600_df, torch, tqdm, train_esmc600_df, train_terms_df):
 
         print(f"Running inference on {n_test} sequences...")
 
-    
+
         # Accumulate local results for this batch
         batch_pids = []
         batch_terms = []
@@ -405,10 +373,10 @@ def _(np, pl, test_esmc600_df, torch, tqdm, train_esmc600_df, train_terms_df):
             # 2. Apply Cutoff threshold
             k_val = min(topk, n_train)
             top_vals, top_inds = torch.topk(sim_batch, k=k_val, dim=1)
-        
+
             # Apply cutoff: zero out low similarity neighbors
             top_vals = torch.where(top_vals > cutoff, top_vals, torch.tensor(0.0, device=device))
-        
+
             # Reconstruct sparse-like sim matrix (reuse memory)
             # Zero out the full density matrix, then scatter the top-k values back
             sim_batch.zero_().scatter_(1, top_inds, top_vals)
@@ -455,7 +423,7 @@ def _(np, pl, test_esmc600_df, torch, tqdm, train_esmc600_df, train_terms_df):
                     "knn_score": batch_scores
                 }, schema={"protein_id": pl.Utf8, "term": pl.Utf8, "knn_score": pl.Float32})
 
-    
+
 
     # --- Execution ---
     # Detect correct column names based on prior context
