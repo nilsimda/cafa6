@@ -1,0 +1,10 @@
+results/
+temp_knn_batches/
+dataset/
+__pycache__/
+__marimo__/
+.venv/
+.env
+.mypy_cache/
+diamond
+
