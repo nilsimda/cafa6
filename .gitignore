@@ -7,4 +7,6 @@ __marimo__/
 .env
 .mypy_cache/
 diamond
+taxonkit
+*.txt
 
