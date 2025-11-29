@@ -10,7 +10,8 @@ def _():
     import polars as pl
     from Bio import SeqIO
     import plotnine as p9
-    return SeqIO, p9, pl
+    from utils import data
+    return data, p9, pl
 
 
 @app.cell
@@ -21,35 +22,18 @@ def _(pl):
 
 
 @app.cell
-def _(SeqIO, pl):
-    def create_test_df(fasta_path="dataset/Test/testsuperset.fasta"):
-
-        data = [
-            (*record.description.split(" ", 1), str(record.seq))
-            for record in SeqIO.parse(fasta_path, "fasta")
-        ]
-
-        return pl.DataFrame(
-            data,
-            schema=[
-                ("protein_id", pl.Utf8),
-                ("taxon_id", pl.Int64),
-                ("sequence", pl.Utf8),
-            ],
-            orient="row"
-        )
-
-    test_df = create_test_df()
+def _(data):
+    test_df = data.create_test_df()
     test_df
     return (test_df,)
 
 
 @app.cell
 def _(p9, pl, test_df):
-    _taxon_counts = test_df.group_by("taxon_id").len().sort("len", descending=True)
+    taxon_counts = test_df.group_by("taxon_id").len().sort("len", descending=True)
 
     _total_seqs = test_df.height
-    _taxon_viz_df = _taxon_counts.with_columns([
+    _taxon_viz_df = taxon_counts.with_columns([
         (pl.col("len") / _total_seqs).alias("pct"),
         (pl.col("len").cum_sum() / _total_seqs).alias("cum_pct"),
         pl.arange(1, pl.len() + 1).alias("rank")
@@ -79,11 +63,61 @@ def _(p9, pl, test_df):
         + p9.theme_minimal()
         + p9.theme(figure_size=(10, 6))
     )
+    return (taxon_counts,)
+
+
+@app.cell
+def _(taxon_counts):
+    taxon_counts.head(90)
     return
 
 
 @app.cell
-def _():
+def _(pl):
+    phylum_df = pl.read_csv("dataset/taxon_phylum.tsv", has_header=False, separator="\t").rename({"column_1": "TaxonID", "column_2": "Phylum"})
+    phylum_df
+    return (phylum_df,)
+
+
+@app.cell
+def _(phylum_df, pl, taxon_counts, test_df):
+    def create_hybrid_features(df, count_df, phylum_df, k=50):
+        top_ids = count_df.head(k)["taxon_id"].to_list()
+    
+        joined_df = df.join(
+            phylum_df, 
+            left_on="taxon_id", 
+            right_on="TaxonID", 
+            how="left"
+        )
+    
+        # Create the hybrid feature column
+        # Logic: If in Top-K -> Use TaxonID (e.g., "9606")
+        #        Else -> Use Phylum (e.g., "Chordata")
+        #        If Phylum missing -> "Other"
+        df_encoded = joined_df.with_columns(
+            pl.when(pl.col("taxon_id").is_in(top_ids))
+            .then(pl.col("taxon_id").cast(pl.String))
+            .otherwise(
+                pl.col("Phylum").fill_null("Other")
+            )
+            .alias("hybrid_taxon")
+        )
+    
+        # One Hot Encode the hybrid column
+        # This generates columns like:
+        #   hybrid_taxon_9606 (Specific)
+        #   hybrid_taxon_Chordata (General fallback)
+        return df_encoded.to_dummies("hybrid_taxon")
+
+    processed_df = create_hybrid_features(
+        test_df,       
+        taxon_counts,  
+        phylum_df,     
+        k=77           
+    )
+
+    processed_df.head(10)
     return
 
 
