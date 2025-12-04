@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.18.1"
+__generated_with = "0.18.2"
 app = marimo.App(width="medium")
 
 
@@ -15,6 +15,23 @@ def _():
 
 
 @app.cell
+def _():
+    from utils.data import create_test_df, create_train_df
+
+    query_ids = create_test_df()["protein_id"].unique().to_list()
+
+    with open("foldseek_work/query_ids.txt", "w") as f:
+        for q_id in query_ids:
+            f.write(f"{q_id}\n")
+
+    ref_ids = create_train_df()["protein_id"].unique().to_list()
+    with open("foldseek_work/ref_ids.txt", "w") as f:
+        for q_id in ref_ids:
+            f.write(f"{q_id}\n")
+    return
+
+
+@app.cell
 def _(requests):
     valid_evidence_codes = {
         "EXP", "IDA", "IPI", "IMP", "IGI", "IEP",  # Experimental
@@ -26,7 +43,7 @@ def _(requests):
     query_ls = []
     query_ls.append(" OR ".join([f"GO_{ec}:*" for ec in valid_evidence_codes])) 
     #query_ls.append(" OR ".join([f"taxonomy_id:{tax_id}" for tax_id in valid_taxa]))
-    query_ls.append(f"date_modified:[* TO 2025-06-18]")
+    query_ls.append(f"date_modified:[* TO 2025-04-23]")
     query_ls.append("reviewed:true") # Swiss-Prot only
 
     full_query = " AND ".join(f"({subquery})" for subquery in query_ls)
@@ -48,6 +65,16 @@ def _(requests):
 
 
 @app.cell
+def _(requests):
+    accession = "P12345"
+    url = f"https://rest.uniprot.org/uniprotkb/{accession}.json"
+    response_p = requests.get(url)
+    data = response_p.json()
+    data
+    return
+
+
+@app.cell
 def _(pl):
     train_terms = pl.read_csv("dataset/Train/train_terms.tsv", separator="\t")
     train_terms.head(10)
@@ -65,22 +92,22 @@ def _(full_query, json, re, requests):
             "format": "json",
             "fields": "accession,sequence,go,organism_id"
         }
-    
+
         results = []
         next_link = None
-    
+
         while True:
             request_url = next_link if next_link else base_url
             # If using next_link, parameters are embedded in the URL
             request_params = None if next_link else params
-        
+
             resp = requests.get(request_url, params=request_params)
             resp.raise_for_status()
-        
+
             data = resp.json()
             if "results" in data:
                 results.extend(data["results"])
-            
+
             link_header = resp.headers.get("Link")
             if link_header:
                 match = re.search(r'<(.+)>; rel="next"', link_header)
@@ -90,7 +117,7 @@ def _(full_query, json, re, requests):
                     break
             else:
                 break
-            
+
         return results
 
     # 1. Fetch raw data
@@ -133,23 +160,23 @@ def _(pl, raw_data, test_taxon_df, train_terms, valid_evidence_codes):
 
             if not int(organism.get("taxonId")) in valid_taxons:
                 continue
-            
+
             # Loop through cross-references to find GO terms
             xrefs = entry.get("uniProtKBCrossReferences", [])
             for xref in xrefs:
                 if xref.get("database") == "GO":
                     props = {p["key"]: p["value"] for p in xref.get("properties", [])}
-                
+
                     # Parse Evidence Code (e.g., "IDA:PubMed:...")
                     ev_type = props.get("GoEvidenceType", "")
                     current_code = ev_type.split(":")[0] if ":" in ev_type else ev_type
-                
+
                     if current_code in valid_codes:
                         go_term = xref.get("id")
                         term_def = props.get("GoTerm", "")
                         # Aspect is typically the first letter (C, F, P)
                         aspect = term_def[0] if term_def else None
-                    
+
                         if aspect in ("C", "F", "P"):
                             extracted.append({
                                 "EntryID": accession,

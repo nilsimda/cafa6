@@ -117,6 +117,22 @@ def _(pl):
 
 
 @app.cell
+def _(pl):
+    blast_col_names = [
+        "qseqid", "sseqid", "pident", "length", "mismatch", "gapopen", 
+        "qstart", "qend", "sstart", "send", "evalue", "bitscore"
+    ]
+    blast_lf = pl.read_csv(
+            "default_results.m8", 
+            separator="\t", 
+            has_header=False, 
+            new_columns=blast_col_names
+    )
+    blast_lf
+    return
+
+
+@app.cell
 def _(pl, train_terms_df):
     # Define column names for BLAST format 6 output
     _blast_col_names = [
@@ -125,40 +141,44 @@ def _(pl, train_terms_df):
     ]
 
     try:
-        print("Reading BLAST results and computing max bit-score per term...")
+        print("Reading BLAST results...")
 
         # Use Lazy API for efficient processing of potential large files
         # 1. Load BLAST results
-        _blast_lf = pl.scan_csv(
-            "results.txt", 
+        _blast_lf = pl.read_csv(
+            "default_results.m8", 
             separator="\t", 
             has_header=False, 
             new_columns=_blast_col_names
         )
 
+
+        print("Cleaning sseqid...")
         # 2. Clean sseqid to match EntryID format
         # Training FASTA headers (UniProt) are typically 'sp|Accession|ID'.
         # We extract 'Accession' (index 1) to join with EntryID in terms data.
-        _blast_clean_lf = _blast_lf.with_columns(
-            pl.when(pl.col("sseqid").str.contains(r"\|"))
-            .then(pl.col("sseqid").str.split("|").list.get(1))
-            .otherwise(pl.col("sseqid"))
-            .alias("sseqid_clean")
-        )
+        #_blast_clean_lf = _blast_lf.with_columns(
+        #    pl.when(pl.col("sseqid").str.contains(r"\|"))
+        #    .then(pl.col("sseqid").str.split("|").list.get(1))
+        #    .otherwise(pl.col("sseqid"))
+        #    .alias("sseqid_clean")
+        #)
 
+        print("Calculate total bit score per query")
         # 3. Calculate total bitscore per query (denominator for knn_score)
         # This sums bitscores of all matched proteins for a query
-        _blast_denom_lf = _blast_clean_lf.group_by("qseqid").agg(
+        _blast_denom_lf = _blast_lf.group_by("qseqid").agg(
             pl.col("bitscore").sum().alias("total_bitscore")
         )
 
+        print("Joining with training terms and aggregate")
         # 4. Join with Training Terms and Aggregate
         # We join hits to their terms using the filtered_terms_df from context
         # For each query (qseqid) and term, we calculate the max bitscore and the knn_score.
         blast_knn_preds_df = (
-            _blast_clean_lf.join(
-                train_terms_df.select(["EntryID", "term"]).lazy(),
-                left_on="sseqid_clean",
+            _blast_lf.join(
+                train_terms_df.select(["EntryID", "term"]),
+                left_on="sseqid",
                 right_on="EntryID",
                 how="inner"
             )
@@ -171,7 +191,6 @@ def _(pl, train_terms_df):
                 (pl.col("term_bitscore_sum") / pl.col("total_bitscore")).alias("knn_score")
             )
             .select(["qseqid", "term", "knn_score"])
-            .collect()  # Execute the plan
             .sort(["qseqid", "knn_score"], descending=[False, True])
         )
 
@@ -188,7 +207,7 @@ def _(pl, train_terms_df):
 
 @app.cell
 def _(blast_knn_preds_df):
-    blast_knn_preds_df.write_csv("blast_knn_preds_full.tsv", separator="\t", include_header=False);
+    blast_knn_preds_df.write_csv("results/mmseq_default_knn_preds_full.tsv", separator="\t", include_header=False);
     return
 
 
@@ -499,6 +518,61 @@ def _():
     )
 
     write_results(df1, dfs_best, out_dir="results", th_step=0.01)
+    return
+
+
+@app.cell
+def _():
+    from cafaeval.parser import obo_parser, gt_parser, pred_parser
+
+    ontologies = obo_parser(obo_file="dataset/Train/go-basic.obo")
+    ontologies
+    return gt_parser, ontologies, pred_parser
+
+
+@app.cell
+def _(gt_parser, ontologies):
+    gts = gt_parser(gt_file="dataset/Train/train_terms.tsv", ontologies=ontologies)
+    gts
+    return (gts,)
+
+
+@app.cell
+def _(gts, ontologies, pred_parser):
+    preds = pred_parser("preds/LR_C.tsv", gts=gts, prop_mode="max", ontologies=ontologies, max_terms=None)
+    preds
+    return (preds,)
+
+
+@app.cell
+def _(preds):
+    preds["cellular_component"].ids
+    return
+
+
+@app.cell
+def _(gts):
+    gts["cellular_component"].ids
+    return
+
+
+@app.cell
+def _(ontologies):
+    class_order_list = [entry["id"] for entry in ontologies["cellular_component"].terms_list]
+    class_order_list
+    return
+
+
+@app.cell
+def _(ontologies, preds):
+    from cafaeval.graph import propagate
+
+    propagate(preds["cellular_component"].matrix, ontologies["cellular_component"], ontologies["cellular_component"].order)
+    return
+
+
+@app.cell
+def _():
     return
 
 

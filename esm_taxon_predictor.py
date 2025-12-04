@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.18.1"
+__generated_with = "0.18.2"
 app = marimo.App(width="medium")
 
 
@@ -9,8 +9,36 @@ def _():
     import marimo as mo
     import polars as pl
     import numpy as np
+    import joblib
     from utils import data
-    return data, np, pl
+    from dotenv import load_dotenv
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import MultiLabelBinarizer
+    from sklearn.multioutput import MultiOutputClassifier
+    from sklearn.linear_model import LogisticRegression
+    from cafaeval.graph import propagate, Prediction
+    from cafaeval.evaluation import evaluate_prediction
+    import os
+    os.environ["KERAS_BACKEND"] = "jax"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+    import keras
+    import wandb
+    from wandb.integration.keras import WandbMetricsLogger
+    import altair as alt
+    return (
+        MultiLabelBinarizer,
+        Prediction,
+        WandbMetricsLogger,
+        alt,
+        data,
+        evaluate_prediction,
+        keras,
+        mo,
+        np,
+        pl,
+        propagate,
+        wandb,
+    )
 
 
 @app.cell
@@ -21,49 +49,589 @@ def _(data, pl):
 
 
 @app.cell
-def _(data, train_df):
-    train_ohe_df = data.onehot_encode_taxon_ids(train_df)
-    return (train_ohe_df,)
+def _(data):
+    test_df = data.create_test_df()
+    test_df
+    return (test_df,)
 
 
 @app.cell
-def _(train_embs_df, train_ohe_df):
-    train_ohe_df.join(train_embs_df, on="protein_id", how="inner")
-    return
+def _(pl, test_df, train_df):
+    top_ids = test_df.group_by("taxon_id").len().sort("len", descending=True).head(20).get_column("taxon_id").to_list()
+    phylum_map = pl.read_csv("dataset/taxon_phylum.tsv", separator="\t", has_header=False).rename({"column_1": "taxon_id", "column_2": "phylum"}).with_columns(pl.col("taxon_id").cast(pl.Int64))
+
+    train_taxon_cat_df = train_df.with_columns(pl.col("taxon_id").cast(pl.Int64)).join(phylum_map, on="taxon_id", how="left").with_columns(
+        pl.when(pl.col("taxon_id").is_in(top_ids))
+          .then(pl.col("taxon_id").cast(pl.String))
+          .otherwise(pl.col("phylum").fill_null("Other"))
+          .alias("taxon_cat")
+    )
+
+    test_taxon_cat_df = test_df.with_columns(pl.col("taxon_id").cast(pl.Int64)).join(phylum_map, on="taxon_id", how="left").with_columns(
+        pl.when(pl.col("taxon_id").is_in(top_ids))
+          .then(pl.col("taxon_id").cast(pl.String))
+          .otherwise(pl.col("phylum").fill_null("Other"))
+          .alias("taxon_cat")
+    )
+    return test_taxon_cat_df, train_taxon_cat_df
 
 
 @app.cell
-def _(np, train_ohe_df):
-    np.stack(train_ohe_df["taxon_ohe"].to_list())
-    return
+def _(alt, mo, test_taxon_cat_df, train_taxon_cat_df):
+    train_taxon_cat_ss_df = train_taxon_cat_df.sample(10_000)
+    test_taxon_cat_ss_df = test_taxon_cat_df.sample(10_000)
 
+    max_y = max(
+        train_taxon_cat_ss_df["taxon_cat"].value_counts().max().get_column("count").item(),
+        test_taxon_cat_ss_df["taxon_cat"].value_counts().max().get_column("count").item()
+    )
 
-@app.cell
-def _(train_df):
-    from sklearn.model_selection import train_test_split
+    y_enc = alt.Y("count()", scale=alt.Scale(domain=[0, max_y]))
 
-    X_train_df, X_val_df = train_test_split(train_df, random_state=3407)
-    return (X_train_df,)
+    chart1 = alt.Chart(train_taxon_cat_ss_df).mark_bar().encode(
+        y=y_enc, x="taxon_cat"
+    )
 
+    chart2 = alt.Chart(test_taxon_cat_ss_df).mark_bar().encode(
+        y=y_enc, x="taxon_cat"
+    )
 
-@app.cell
-def _(X_train_df):
-    X_train_df
+    mo.ui.altair_chart(chart1 & chart2)
+
     return
 
 
 @app.cell
 def _(pl):
-    labels_df = pl.read_csv("dataset/Train/train_terms.tsv", separator="\t")
-    labels_df
-    return (labels_df,)
+    test_embs_df = pl.read_parquet("dataset/Test/test_esmc_600m.parquet")
+    test_embs_df
+    return (test_embs_df,)
 
 
 @app.cell
-def _(labels_df, pl):
-    labels_df.group_by("aspect").agg(
-        pl.col("term").n_unique()
+def _(data, test_df, train_df):
+    train_ohe_df = data.onehot_encode_taxon_ids(train_df, k=20)
+    test_ohe_df = data.onehot_encode_taxon_ids(test_df, k=20)
+    return test_ohe_df, train_ohe_df
+
+
+@app.cell
+def _(train_embs_df, train_ohe_df):
+    train_ohe_embs_df = train_ohe_df.join(train_embs_df, on="protein_id", how="inner")
+    train_ohe_embs_df
+    return (train_ohe_embs_df,)
+
+
+@app.cell
+def _(test_embs_df, test_ohe_df):
+    test_ohe_embs_df = test_ohe_df.join(test_embs_df, on="protein_id", how="inner")
+    test_ohe_embs_df
+    return (test_ohe_embs_df,)
+
+
+@app.cell
+def _(pl):
+    def create_stratified_split(df, test_df, category_col, valid_size=0.2):
+        """
+        Create a validation set that matches the test set's categorical distribution.
+    
+        Parameters:
+        - df: Training dataframe to split
+        - test_df: Test dataframe (used only to compute target distribution)
+        - category_col: Name of categorical column to stratify on
+        - valid_size: Fraction of df to use for validation
+        """
+    
+        # Get the distribution from test set
+        test_dist = (
+            test_df
+            .group_by(category_col)
+            .agg(pl.len().alias('count'))
+            .with_columns((pl.col('count') / pl.col('count').sum()).alias('proportion'))
+        )
+    
+        # Sample from each category proportionally
+        valid_dfs = []
+        train_dfs = []
+    
+        for row in test_dist.iter_rows(named=True):
+            category = row[category_col]
+            target_prop = row['proportion']
+        
+            # Get all rows for this category
+            category_df = df.filter(pl.col(category_col) == category)
+            n_total = len(category_df)
+        
+            # Calculate how many to sample for validation
+            n_valid = int(n_total * valid_size * target_prop / 
+                          (test_dist.filter(pl.col(category_col) == category)['proportion'][0]))
+            n_valid = min(n_valid, n_total)  # Don't exceed available samples
+        
+            # Sample
+            valid_sample = category_df.sample(n=n_valid, shuffle=True, seed=42)
+            train_sample = category_df.join(valid_sample, how='anti', on=df.columns)
+        
+            valid_dfs.append(valid_sample)
+            train_dfs.append(train_sample)
+    
+        valid_set = pl.concat(valid_dfs)
+        train_set = pl.concat(train_dfs)
+    
+        return train_set, valid_set
+
+    # Usage
+    #train_df, valid_df = create_stratified_split(df, test_df, 'category_column', valid_size=0.2)
+    return (create_stratified_split,)
+
+
+@app.cell
+def _(create_stratified_split, pl, test_taxon_cat_df, train_taxon_cat_df):
+    def create_trainval_split():
+        labels_df = pl.read_csv("dataset/Train/train_terms.tsv", separator="\t")
+        aspect_dfs = labels_df.group_by("EntryID", "aspect").agg(pl.col("term")).partition_by(by="aspect", as_dict=True)
+    
+    
+        for aspect in aspect_dfs.keys():
+            aspect_labels_df = aspect_dfs[aspect]
+            aspect_full_df = aspect_labels_df.join(train_taxon_cat_df, how="left", left_on="EntryID", right_on="protein_id")
+            trainset_df_aspect, valset_df_aspect = create_stratified_split(aspect_full_df, test_taxon_cat_df, "taxon_cat", valid_size=0.2)
+            trainset_df_aspect["EntryID", "term", "aspect"].explode("term").write_csv(f"dataset/Split/train_aspect_{aspect[0]}_gt.tsv", separator="\t")
+            valset_df_aspect["EntryID", "term", "aspect"].explode("term").write_csv(f"dataset/Split/val_aspect_{aspect[0]}_gt.tsv", separator="\t")
+
+    create_trainval_split()
+    return
+
+
+@app.cell
+def _():
+    from cafaeval.parser import obo_parser, gt_parser
+
+    ontologies = obo_parser("dataset/Train/go-basic.obo", ("is_a", "part_of"),  "dataset/IA.tsv", True)
+
+    gts = {aspect: gt_parser(f"dataset/Split/val_aspect_{aspect}_gt.tsv", ontologies) for aspect in ["C", "F", "P"]}
+
+    label_order_c = [term["id"] for term in ontologies["cellular_component"].terms_list]
+    label_order_f = [term["id"] for term in ontologies["molecular_function"].terms_list]
+    label_order_p = [term["id"] for term in ontologies["biological_process"].terms_list]
+
+    label_order_dict = {"C": label_order_c, "F": label_order_f, "P": label_order_p}
+    return gts, label_order_dict, ontologies
+
+
+@app.cell
+def _(MultiLabelBinarizer, label_order_dict, np, pl, train_ohe_embs_df):
+    def create_aspect_dataset(aspect):
+        train_aspect_terms_df = pl.read_csv(f"dataset/Split/train_aspect_{aspect}_gt.tsv", separator="\t")
+        val_aspect_terms_df = pl.read_csv(f"dataset/Split/val_aspect_{aspect}_gt.tsv", separator="\t")
+
+        train_aspect_df = train_aspect_terms_df.group_by("EntryID").agg(pl.col("term")).join(train_ohe_embs_df, how="left", left_on="EntryID", right_on="protein_id")
+
+        val_aspect_df = val_aspect_terms_df.group_by("EntryID").agg(pl.col("term")).join(train_ohe_embs_df, how="left", left_on="EntryID", right_on="protein_id")
+
+        train_taxon_ohe_aspect = np.stack(train_aspect_df["taxon_ohe"].to_list())
+        train_embs_aspect = np.stack(train_aspect_df["embedding"].to_list())
+        X_train = np.hstack([train_taxon_ohe_aspect, train_embs_aspect])
+
+        val_taxon_ohe_aspect = np.stack(val_aspect_df["taxon_ohe"].to_list())
+        val_embs_aspect = np.stack(val_aspect_df["embedding"].to_list())
+        X_val = np.hstack([val_taxon_ohe_aspect, val_embs_aspect])
+
+        mlb = MultiLabelBinarizer(classes=label_order_dict[aspect])
+        mlb.fit(train_aspect_df.vstack(val_aspect_df)["term"])
+
+        y_train = mlb.transform(train_aspect_df["term"])
+        y_val = mlb.transform(val_aspect_df["term"])
+
+
+        val_prot_ids_aspect = val_aspect_df["EntryID"].to_list()
+        return X_train, X_val, y_train, y_val, val_prot_ids_aspect
+
+    X_train_c, X_val_c, y_train_c, y_val_c, val_prot_ids_c = create_aspect_dataset("C")
+    X_train_f, X_val_f, y_train_f, y_val_f, val_prot_ids_f = create_aspect_dataset("F")
+    X_train_p, X_val_p, y_train_p, y_val_p, val_prot_ids_p = create_aspect_dataset("P")
+    return (
+        X_train_c,
+        X_train_f,
+        X_train_p,
+        X_val_c,
+        X_val_f,
+        X_val_p,
+        val_prot_ids_c,
+        val_prot_ids_f,
+        val_prot_ids_p,
+        y_train_c,
+        y_train_f,
+        y_train_p,
+        y_val_c,
+        y_val_f,
+        y_val_p,
     )
+
+
+@app.cell
+def _(Prediction, evaluate_prediction, keras, np, propagate):
+    class CafaEvalCallback(keras.callbacks.Callback):
+        def __init__(self, validation_data, prot_ids, ns, ontologies, gt):
+            super().__init__()
+            self.X_val, self.y_val = validation_data
+            self.prot_ids = prot_ids
+            self.ns = ns
+            self.ontologies = ontologies
+            self.gt = gt
+            self.tau_arr = np.arange(0.1, 1, 0.1)
+
+        def on_epoch_end(self, epoch, logs=None):
+            # Get predictions for all validation data
+            y_pred = self.model.predict(self.X_val, verbose=0)
+
+            gt_ns = self.gt[self.ns]
+            num_prots, num_terms = gt_ns.matrix.shape
+            mat = np.zeros((num_prots, num_terms), dtype=np.float32)
+
+            for prot_id, scores in zip(self.prot_ids, y_pred):
+                if prot_id in gt_ns.ids:
+                    mat[gt_ns.ids[prot_id]] = scores
+
+            propagate(mat, self.ontologies[self.ns], 
+                     self.ontologies[self.ns].order, mode='max')
+            predictions = {self.ns: Prediction(gt_ns.ids, mat, self.ns)}
+
+            eval_df = evaluate_prediction(predictions, self.gt, self.ontologies,
+                                         self.tau_arr, normalization="cafa", n_cpu=1)
+
+            rc_w_score = eval_df["rc_w"].max().item()
+            pr_w_score = eval_df["pr_w"].max().item()
+            f_w_score = eval_df["f_w"].max().item()
+            f_micro_w_score = eval_df["f_micro_w"].max().item()
+
+            logs['val_cafaeval_f_w'] = f_w_score
+            logs['val_cafaeval_f_micro_w'] = f_micro_w_score
+            logs['val_cafaeval_rc_w'] = rc_w_score
+            logs['val_cafaeval_pr_w'] = pr_w_score
+    return (CafaEvalCallback,)
+
+
+@app.cell
+def _(
+    CafaEvalCallback,
+    WandbMetricsLogger,
+    X_train_c,
+    X_val_c,
+    gts,
+    keras,
+    ontologies,
+    val_prot_ids_c,
+    wandb,
+    y_train_c,
+    y_val_c,
+):
+    epochs = 100
+    batch_size = 512
+
+    # Initialize WandB run
+    wandb.init(
+        project="cafa-6",
+        name="MLP_Aspect_C_stratified_valset",
+        config={
+            "architecture": "MLP",
+            "aspect": "C",
+            "input_dim": X_train_c.shape[1],
+            "output_dim": y_train_c.shape[1],
+            "batch_size": batch_size,
+            "epochs": epochs,
+            "learning_rate": 0.001,
+        }
+    )
+
+    def build_mlp_aspect_model(input_dim, output_dim):
+        """
+        Builds a Multilayer Perceptron for multi-label classification.
+        """
+        model = keras.Sequential([
+            keras.layers.Input(shape=(input_dim,)),
+            keras.layers.Dense(1024, activation="relu"),
+            keras.layers.BatchNormalization(),
+            keras.layers.Dropout(0.3),
+            keras.layers.Dense(512, activation="relu"),
+            keras.layers.BatchNormalization(),
+            keras.layers.Dropout(0.3),
+            keras.layers.Dense(output_dim, activation="sigmoid")
+        ])
+
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            loss="binary_crossentropy",#weighted_binary_crossentropy(weight_vector_tensor),
+            metrics=[
+                # Micro F1 appropriate for class imbalance in multi-label settings
+                #keras.metrics.F1Score(average="micro", threshold=0.5, name="f1_micro"),
+                #keras.metrics.F1Score(average="macro", threshold=0.5, name="f1_macro"),
+            ]
+        )
+        return model
+
+    # Instantiate and train
+    mlp_model_c = build_mlp_aspect_model(X_train_c.shape[1], y_train_c.shape[1])
+    mlp_model_c.summary()
+
+    history_c = mlp_model_c.fit(
+        X_train_c,
+        y_train_c,
+        validation_data=(X_val_c, y_val_c),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=[CafaEvalCallback((X_val_c, y_val_c), val_prot_ids_c, "cellular_component", ontologies, gts["C"]), 
+                   keras.callbacks.EarlyStopping(monitor="val_cafaeval_f_w", patience=10, mode="max"),
+                   keras.callbacks.ModelCheckpoint(
+                        filepath="keras_models/best_mlp_model_c.keras",  # or .h5
+                        monitor="val_cafaeval_f_w",
+                        mode="max",
+                        save_best_only=True,
+                        verbose=1
+                        ),
+                   WandbMetricsLogger(),
+                  ],
+        verbose=1
+    )
+
+    wandb.finish()
+    return batch_size, build_mlp_aspect_model, epochs
+
+
+@app.cell
+def _(
+    CafaEvalCallback,
+    WandbMetricsLogger,
+    X_train_c,
+    X_train_f,
+    X_val_f,
+    batch_size,
+    build_mlp_aspect_model,
+    epochs,
+    gts,
+    keras,
+    ontologies,
+    val_prot_ids_f,
+    wandb,
+    y_train_c,
+    y_train_f,
+    y_val_f,
+):
+    wandb.init(
+        project="cafa-6",
+        name="MLP_Aspect_F_stratified_valset",
+        config={
+            "architecture": "MLP",
+            "aspect": "F",
+            "input_dim": X_train_c.shape[1],
+            "output_dim": y_train_c.shape[1],
+            "batch_size": batch_size,
+            "epochs": epochs,
+            "learning_rate": 0.001,
+        }
+    )
+
+    mlp_model_f = build_mlp_aspect_model(X_train_f.shape[1], y_train_f.shape[1])
+    mlp_model_f.summary()
+
+    history_f = mlp_model_f.fit(
+        X_train_f,
+        y_train_f,
+        validation_data=(X_val_f, y_val_f),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=[CafaEvalCallback((X_val_f, y_val_f), val_prot_ids_f, "molecular_function", ontologies, gts["F"]), 
+                   keras.callbacks.EarlyStopping(monitor="val_cafaeval_f_w", patience=10, mode="max"),
+                   keras.callbacks.ModelCheckpoint(
+                        filepath="keras_models/best_mlp_model_f.keras",  # or .h5
+                        monitor="val_cafaeval_f_w",
+                        mode="max",
+                        save_best_only=True,
+                        verbose=1
+                        ),
+                   WandbMetricsLogger(),
+                  ],
+        verbose=1
+    )
+
+    wandb.finish()
+    return
+
+
+@app.cell
+def _(
+    CafaEvalCallback,
+    WandbMetricsLogger,
+    X_train_c,
+    X_train_p,
+    X_val_p,
+    batch_size,
+    build_mlp_aspect_model,
+    epochs,
+    gts,
+    keras,
+    ontologies,
+    val_prot_ids_p,
+    wandb,
+    y_train_c,
+    y_train_p,
+    y_val_p,
+):
+    wandb.init(
+        project="cafa-6",
+        name="MLP_Aspect_P_stratified_valset",
+        config={
+            "architecture": "MLP",
+            "aspect": "P",
+            "input_dim": X_train_c.shape[1],
+            "output_dim": y_train_c.shape[1],
+            "batch_size": batch_size,
+            "epochs": epochs,
+            "learning_rate": 0.001,
+        }
+    )
+
+    mlp_model_p = build_mlp_aspect_model(X_train_p.shape[1], y_train_p.shape[1])
+    mlp_model_p.summary()
+
+    history_p = mlp_model_p.fit(
+        X_train_p,
+        y_train_p,
+        validation_data=(X_val_p, y_val_p),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=[CafaEvalCallback((X_val_p, y_val_p), val_prot_ids_p, "biological_process", ontologies, gts["P"]), 
+                   keras.callbacks.EarlyStopping(monitor="val_cafaeval_f_w", patience=10, mode="max"),
+                   keras.callbacks.ModelCheckpoint(
+                        filepath="keras_models/best_mlp_model_p.keras",  # or .h5
+                        monitor="val_cafaeval_f_w",
+                        mode="max",
+                        save_best_only=True,
+                        verbose=1
+                        ),
+                   WandbMetricsLogger()
+                  ],
+        verbose=1
+    )
+
+    wandb.finish()
+    return
+
+
+@app.cell
+def _(np, test_ohe_embs_df):
+    _test_ohes = np.stack(test_ohe_embs_df["taxon_ohe"].to_list())
+    _test_embs = np.stack(test_ohe_embs_df["esmc_600m_embedding"].to_list())
+    X_test = np.hstack([_test_ohes, _test_embs])
+    return (X_test,)
+
+
+@app.cell
+def _(X_test, keras, label_order_dict, np, pl, test_ohe_embs_df):
+    import gc
+
+    def generate_predictions_for_aspect(aspect, model_path, X_input, protein_ids, label_list, threshold=0.01, chunk_size=5000):
+        """
+        Generates predictions for a specific aspect using a saved Keras model,
+        optimizing for memory by processing in chunks and clearing objects immediately.
+        """
+        print(f"Loading model for aspect {aspect} from {model_path}...")
+        model = keras.models.load_model(model_path)
+
+        # Convert label list to array for fast indexing
+        term_arr = np.array(label_list)
+
+        all_ids = []
+        all_terms = []
+        all_scores = []
+
+        num_samples = len(protein_ids)
+        print(f"Generating predictions for {aspect} in chunks...")
+
+        # Iterate in chunks to avoid OOM
+        for start_idx in range(0, num_samples, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_samples)
+
+            # Prepare batch
+            X_chunk = X_input[start_idx:end_idx]
+            ids_chunk = protein_ids[start_idx:end_idx]
+
+            # Predict
+            # Using a proper batch_size for GPU efficiency, while chunk_size manages RAM
+            y_pred = model.predict(X_chunk, verbose=0, batch_size=128)
+
+            # Filter predictions
+            _rows, _cols = np.where(y_pred > threshold)
+            _scores = y_pred[_rows, _cols]
+
+            # Append valid predictions
+            if len(_scores) > 0:
+                all_ids.append(ids_chunk[_rows])
+                all_terms.append(term_arr[_cols])
+                all_scores.append(_scores)
+
+            # Clean up chunk memory
+            del y_pred, _rows, _cols, _scores, X_chunk
+            gc.collect()
+
+            print(f"Processed {end_idx}/{num_samples} samples")
+
+        # Explicit memory cleanup
+        del model
+        gc.collect()
+
+        print(f"Concatenating results for {aspect}...")
+        if not all_ids:
+            df = pl.DataFrame({
+                "EntryID": [],
+                "term": [],
+                "score": []
+            }, schema={"EntryID": pl.Utf8, "term": pl.Utf8, "score": pl.Float64})
+        else:
+            df = pl.DataFrame({
+                "EntryID": np.concatenate(all_ids),
+                "term": np.concatenate(all_terms),
+                "score": np.concatenate(all_scores)
+            })
+
+        return df
+
+    # Get test IDs once
+    _test_protein_ids = test_ohe_embs_df["protein_id"].to_numpy()
+
+    # Generate predictions for each aspect
+    submission_c = generate_predictions_for_aspect(
+        aspect="C",
+        model_path="keras_models/best_mlp_model_c.keras",
+        X_input=X_test,
+        protein_ids=_test_protein_ids,
+        label_list=label_order_dict["C"]
+    )
+
+    submission_f = generate_predictions_for_aspect(
+        aspect="F",
+        model_path="keras_models/best_mlp_model_f.keras",
+        X_input=X_test,
+        protein_ids=_test_protein_ids,
+        label_list=label_order_dict["F"]
+    )
+
+    submission_p = generate_predictions_for_aspect(
+        aspect="P",
+        model_path="keras_models/best_mlp_model_p.keras",
+        X_input=X_test,
+        protein_ids=_test_protein_ids,
+        label_list=label_order_dict["P"]
+    )
+
+    # Combine all predictions
+    print("Concatenating and saving submission...")
+    final_submission_df = pl.concat([submission_c, submission_f, submission_p])
+
+    # Write to TSV (no header, tab-separated as per CAFA format)
+    final_submission_df.write_csv("submission.tsv", separator="\t", include_header=False)
+    print(f"Submission saved with {len(final_submission_df)} predictions.")
+
+    final_submission_df
     return
 
 

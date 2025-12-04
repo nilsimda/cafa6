@@ -1,6 +1,7 @@
 from cafaeval.graph import Graph, Prediction, GroundTruth, propagate
 import numpy as np
 import logging
+import time
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 # import xml.etree.ElementTree as ET
 
@@ -177,7 +178,7 @@ def gt_exclude_parser(exclude_file, gt, ontologies):
     return exclude
 
 
-def pred_parser(pred_file, ontologies, gts, prop_mode, max_terms=None):
+def pred_parser(pred_file, ontologies, gts, prop_mode, max_terms=None, progress=False, progress_interval=1000000):
     """
     Parse a prediction file and returns a list of prediction objects, one for each namespace.
     If a predicted is predicted multiple times for the same target, it stores the max.
@@ -195,10 +196,13 @@ def pred_parser(pred_file, ontologies, gts, prop_mode, max_terms=None):
         for term in ontologies[ns].terms_dict_alt:
             ns_dict[term] = ns
 
+    start_time = time.perf_counter()
+    line_count = 0
     with open(pred_file) as f:
         for line in f:
             line = line.strip().split()
             if line and len(line) > 2:
+                line_count += 1
                 p_id, term_id, prob = line[:3]
                 ns = ns_dict.get(term_id)
                 if ns in gts and p_id in gts[ns].ids:
@@ -216,6 +220,10 @@ def pred_parser(pred_file, ontologies, gts, prop_mode, max_terms=None):
                             ids[ns][p_id] = i
                             matrix[ns][i, j] = max(matrix[ns][i, j], float(prob))
 
+            if progress and progress_interval and line_count and line_count % progress_interval == 0:
+                elapsed = time.perf_counter() - start_time
+                print(f"[CAFA-EVAL] Parsing {pred_file}: {line_count:,} prediction lines processed in {elapsed:.1f}s", flush=True)
+
     predictions = {}
     for ns in ids:
         if ids[ns]:
@@ -226,6 +234,10 @@ def pred_parser(pred_file, ontologies, gts, prop_mode, max_terms=None):
             predictions[ns] = Prediction(ids[ns], matrix[ns], ns)
             logging.info("Prediction: {}, {}, proteins {}, annotations {}, replaced alt. ids {}".format(pred_file, ns, len(ids[ns]),
                                                                                 np.count_nonzero(matrix[ns]), replaced.get(ns, 0)))
+
+    if progress:
+        elapsed = time.perf_counter() - start_time
+        print(f"[CAFA-EVAL] Finished parsing {pred_file}: {line_count:,} lines in {elapsed:.1f}s", flush=True)
 
     if not predictions:
         # raise Exception("Empty prediction, check format")

@@ -9,4 +9,18 @@ __marimo__/
 diamond
 taxonkit
 *.txt
+preds/
+mmseqs_dbs/
+foldseek/
+foldseek_work/
+keras_models/
+tmp/
+swissprot_release/
+*.m8
+*.gz
+*.csv
+*.tsv
+taxonkit
+wandb/
+
 
