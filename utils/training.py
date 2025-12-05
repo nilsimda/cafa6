@@ -156,11 +156,12 @@ class CafaEvalCallback(keras.callbacks.Callback):
                                      self.tau_arr, normalization="cafa", n_cpu=1)
         
         f_w_score = eval_df["f_w"].max().item()
+        best_idx = eval_df["f_w"].idxmax()
         
         if logs is not None:
             logs['val_cafaeval_f_w'] = f_w_score
-            logs['val_cafaeval_rc_w'] = eval_df["rc_w"].max().item()
-            logs['val_cafaeval_pr_w'] = eval_df["pr_w"].max().item()
+            logs['val_cafaeval_rc_w'] = eval_df[best_idx, "rc_w"]
+            logs['val_cafaeval_pr_w'] = eval_df[best_idx, "pr_w"]
         
         if f_w_score > self.best_f_w:
             self.best_f_w = f_w_score
