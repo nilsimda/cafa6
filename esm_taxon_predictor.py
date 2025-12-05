@@ -97,7 +97,6 @@ def _(alt, mo, test_taxon_cat_df, train_taxon_cat_df):
     )
 
     mo.ui.altair_chart(chart1 & chart2)
-
     return
 
 
@@ -134,14 +133,14 @@ def _(pl):
     def create_stratified_split(df, test_df, category_col, valid_size=0.2):
         """
         Create a validation set that matches the test set's categorical distribution.
-    
+
         Parameters:
         - df: Training dataframe to split
         - test_df: Test dataframe (used only to compute target distribution)
         - category_col: Name of categorical column to stratify on
         - valid_size: Fraction of df to use for validation
         """
-    
+
         # Get the distribution from test set
         test_dist = (
             test_df
@@ -149,34 +148,34 @@ def _(pl):
             .agg(pl.len().alias('count'))
             .with_columns((pl.col('count') / pl.col('count').sum()).alias('proportion'))
         )
-    
+
         # Sample from each category proportionally
         valid_dfs = []
         train_dfs = []
-    
+
         for row in test_dist.iter_rows(named=True):
             category = row[category_col]
             target_prop = row['proportion']
-        
+
             # Get all rows for this category
             category_df = df.filter(pl.col(category_col) == category)
             n_total = len(category_df)
-        
+
             # Calculate how many to sample for validation
             n_valid = int(n_total * valid_size * target_prop / 
                           (test_dist.filter(pl.col(category_col) == category)['proportion'][0]))
             n_valid = min(n_valid, n_total)  # Don't exceed available samples
-        
+
             # Sample
             valid_sample = category_df.sample(n=n_valid, shuffle=True, seed=42)
             train_sample = category_df.join(valid_sample, how='anti', on=df.columns)
-        
+
             valid_dfs.append(valid_sample)
             train_dfs.append(train_sample)
-    
+
         valid_set = pl.concat(valid_dfs)
         train_set = pl.concat(train_dfs)
-    
+
         return train_set, valid_set
 
     # Usage
@@ -189,8 +188,8 @@ def _(create_stratified_split, pl, test_taxon_cat_df, train_taxon_cat_df):
     def create_trainval_split():
         labels_df = pl.read_csv("dataset/Train/train_terms.tsv", separator="\t")
         aspect_dfs = labels_df.group_by("EntryID", "aspect").agg(pl.col("term")).partition_by(by="aspect", as_dict=True)
-    
-    
+
+
         for aspect in aspect_dfs.keys():
             aspect_labels_df = aspect_dfs[aspect]
             aspect_full_df = aspect_labels_df.join(train_taxon_cat_df, how="left", left_on="EntryID", right_on="protein_id")
@@ -312,43 +311,16 @@ def _(Prediction, evaluate_prediction, keras, np, propagate):
 
 
 @app.cell
-def _(
-    CafaEvalCallback,
-    WandbMetricsLogger,
-    X_train_c,
-    X_val_c,
-    gts,
-    keras,
-    ontologies,
-    val_prot_ids_c,
-    wandb,
-    y_train_c,
-    y_val_c,
-):
-    epochs = 100
-    batch_size = 512
-
-    # Initialize WandB run
-    wandb.init(
-        project="cafa-6",
-        name="MLP_Aspect_C_stratified_valset",
-        config={
-            "architecture": "MLP",
-            "aspect": "C",
-            "input_dim": X_train_c.shape[1],
-            "output_dim": y_train_c.shape[1],
-            "batch_size": batch_size,
-            "epochs": epochs,
-            "learning_rate": 0.001,
-        }
-    )
-
+def _(keras):
     def build_mlp_aspect_model(input_dim, output_dim):
         """
         Builds a Multilayer Perceptron for multi-label classification.
         """
         model = keras.Sequential([
             keras.layers.Input(shape=(input_dim,)),
+            keras.layers.Dense(2048, activation="relu"),
+            keras.layers.BatchNormalization(),
+            keras.layers.Dropout(0.3),
             keras.layers.Dense(1024, activation="relu"),
             keras.layers.BatchNormalization(),
             keras.layers.Dropout(0.3),
@@ -360,41 +332,23 @@ def _(
 
         model.compile(
             optimizer=keras.optimizers.Adam(learning_rate=0.001),
-            loss="binary_crossentropy",#weighted_binary_crossentropy(weight_vector_tensor),
-            metrics=[
-                # Micro F1 appropriate for class imbalance in multi-label settings
-                #keras.metrics.F1Score(average="micro", threshold=0.5, name="f1_micro"),
-                #keras.metrics.F1Score(average="macro", threshold=0.5, name="f1_macro"),
-            ]
+            loss="binary_crossentropy",
         )
         return model
+    return (build_mlp_aspect_model,)
 
-    # Instantiate and train
-    mlp_model_c = build_mlp_aspect_model(X_train_c.shape[1], y_train_c.shape[1])
-    mlp_model_c.summary()
 
-    history_c = mlp_model_c.fit(
-        X_train_c,
-        y_train_c,
-        validation_data=(X_val_c, y_val_c),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=[CafaEvalCallback((X_val_c, y_val_c), val_prot_ids_c, "cellular_component", ontologies, gts["C"]), 
-                   keras.callbacks.EarlyStopping(monitor="val_cafaeval_f_w", patience=10, mode="max"),
-                   keras.callbacks.ModelCheckpoint(
-                        filepath="keras_models/best_mlp_model_c.keras",  # or .h5
-                        monitor="val_cafaeval_f_w",
-                        mode="max",
-                        save_best_only=True,
-                        verbose=1
-                        ),
-                   WandbMetricsLogger(),
-                  ],
-        verbose=1
-    )
+@app.cell
+def _(label_order_dict, pl):
+    IA_df = pl.read_csv("dataset/IA.tsv", separator="\t", has_header=False)
+    class_weights_by_aspect = {}
+    for aspect in ["C", "F", "P"]:
+        ia_w = IA_df.filter(pl.col("column_1").is_in(label_order_dict[aspect])).sort(by="column_1")["column_2"].to_list()
+        weights_dict = {i: w for i, w in enumerate(ia_w)}
+        class_weights_by_aspect[aspect] = weights_dict
 
-    wandb.finish()
-    return batch_size, build_mlp_aspect_model, epochs
+    class_weights_by_aspect
+    return (class_weights_by_aspect,)
 
 
 @app.cell
@@ -403,117 +357,133 @@ def _(
     WandbMetricsLogger,
     X_train_c,
     X_train_f,
-    X_val_f,
-    batch_size,
-    build_mlp_aspect_model,
-    epochs,
-    gts,
-    keras,
-    ontologies,
-    val_prot_ids_f,
-    wandb,
-    y_train_c,
-    y_train_f,
-    y_val_f,
-):
-    wandb.init(
-        project="cafa-6",
-        name="MLP_Aspect_F_stratified_valset",
-        config={
-            "architecture": "MLP",
-            "aspect": "F",
-            "input_dim": X_train_c.shape[1],
-            "output_dim": y_train_c.shape[1],
-            "batch_size": batch_size,
-            "epochs": epochs,
-            "learning_rate": 0.001,
-        }
-    )
-
-    mlp_model_f = build_mlp_aspect_model(X_train_f.shape[1], y_train_f.shape[1])
-    mlp_model_f.summary()
-
-    history_f = mlp_model_f.fit(
-        X_train_f,
-        y_train_f,
-        validation_data=(X_val_f, y_val_f),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=[CafaEvalCallback((X_val_f, y_val_f), val_prot_ids_f, "molecular_function", ontologies, gts["F"]), 
-                   keras.callbacks.EarlyStopping(monitor="val_cafaeval_f_w", patience=10, mode="max"),
-                   keras.callbacks.ModelCheckpoint(
-                        filepath="keras_models/best_mlp_model_f.keras",  # or .h5
-                        monitor="val_cafaeval_f_w",
-                        mode="max",
-                        save_best_only=True,
-                        verbose=1
-                        ),
-                   WandbMetricsLogger(),
-                  ],
-        verbose=1
-    )
-
-    wandb.finish()
-    return
-
-
-@app.cell
-def _(
-    CafaEvalCallback,
-    WandbMetricsLogger,
-    X_train_c,
     X_train_p,
+    X_val_c,
+    X_val_f,
     X_val_p,
     batch_size,
     build_mlp_aspect_model,
+    class_weights_by_aspect,
     epochs,
     gts,
     keras,
     ontologies,
+    val_prot_ids_c,
+    val_prot_ids_f,
     val_prot_ids_p,
     wandb,
     y_train_c,
+    y_train_f,
     y_train_p,
+    y_val_c,
+    y_val_f,
     y_val_p,
 ):
-    wandb.init(
-        project="cafa-6",
-        name="MLP_Aspect_P_stratified_valset",
-        config={
-            "architecture": "MLP",
-            "aspect": "P",
-            "input_dim": X_train_c.shape[1],
-            "output_dim": y_train_c.shape[1],
-            "batch_size": batch_size,
-            "epochs": epochs,
-            "learning_rate": 0.001,
+    def train_aspect_model(
+        aspect,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        val_prot_ids,
+        ontologies,
+        gts,
+        epochs=500,
+        batch_size=512,
+        learning_rate=0.01,
+        wandb_project="cafa-6",
+        wandb_name_suffix="_decay_lr_on_plat"
+    ):
+        """
+        Trains and evaluates an MLP model for a specific GO aspect (C, F, or P).
+        """
+        namespace_map = {
+            "C": "cellular_component",
+            "F": "molecular_function",
+            "P": "biological_process"
         }
+
+        # Identify namespace and Ground Truth for this aspect
+        ns = namespace_map[aspect]
+        gt_aspect = gts[aspect]
+
+        # Initialize WandB run
+        run_name = f"MLP_Aspect_{aspect}{wandb_name_suffix}"
+        wandb.init(
+            project=wandb_project,
+            name=run_name,
+            config={
+                "architecture": "MLP",
+                "aspect": aspect,
+                "input_dim": X_train.shape[1],
+                "output_dim": y_train.shape[1],
+                "batch_size": batch_size,
+                "epochs": epochs,
+                "learning_rate": learning_rate,
+            },
+        )
+
+        print(f"[{aspect}] Building model...")
+        # Build model using function from previous context
+        model = build_mlp_aspect_model(X_train.shape[1], y_train.shape[1])
+
+        # Re-compile to ensure specific learning rate is used
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+            loss="binary_crossentropy"
+        )
+
+        # Define Callbacks
+        model_save_path = f"keras_models/best_mlp_model_{aspect.lower()}.keras"
+        callbacks = [
+            CafaEvalCallback(
+                (X_val, y_val), 
+                val_prot_ids, 
+                ns, 
+                ontologies, 
+                gt_aspect
+            ),
+            #keras.callbacks.EarlyStopping(monitor="val_cafaeval_f_w", patience=10, mode="max"),
+            keras.callbacks.ReduceLROnPlateau(monitor="val_cafaeval_f_w", mode="max"),
+            keras.callbacks.ModelCheckpoint(
+                filepath=model_save_path,
+                monitor="val_cafaeval_f_w",
+                mode="max",
+                save_best_only=True,
+                verbose=1
+            ),
+            WandbMetricsLogger()
+        ]
+
+        print(f"[{aspect}] Starting training...")
+        history = model.fit(
+            X_train,
+            y_train,
+            validation_data=(X_val, y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=1,
+            class_weight=class_weights_by_aspect[aspect]
+        )
+
+        wandb.finish()
+        print(f"[{aspect}] Training finished. Best model saved to {model_save_path}")
+
+        return model, history
+
+    # Execute training for all three aspects using the function
+    _model_c, _history_c = train_aspect_model(
+        "C", X_train_c, y_train_c, X_val_c, y_val_c, val_prot_ids_c, ontologies, gts)
+
+    _model_f, _history_f = train_aspect_model(
+        "F", X_train_f, y_train_f, X_val_f, y_val_f, val_prot_ids_f, ontologies, gts, 
+        epochs=epochs, batch_size=batch_size
     )
 
-    mlp_model_p = build_mlp_aspect_model(X_train_p.shape[1], y_train_p.shape[1])
-    mlp_model_p.summary()
-
-    history_p = mlp_model_p.fit(
-        X_train_p,
-        y_train_p,
-        validation_data=(X_val_p, y_val_p),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=[CafaEvalCallback((X_val_p, y_val_p), val_prot_ids_p, "biological_process", ontologies, gts["P"]), 
-                   keras.callbacks.EarlyStopping(monitor="val_cafaeval_f_w", patience=10, mode="max"),
-                   keras.callbacks.ModelCheckpoint(
-                        filepath="keras_models/best_mlp_model_p.keras",  # or .h5
-                        monitor="val_cafaeval_f_w",
-                        mode="max",
-                        save_best_only=True,
-                        verbose=1
-                        ),
-                   WandbMetricsLogger()
-                  ],
-        verbose=1
+    _model_p, _history_p = train_aspect_model(
+        "P", X_train_p, y_train_p, X_val_p, y_val_p, val_prot_ids_p, ontologies, gts, epochs=300
     )
-
-    wandb.finish()
     return
 
 
@@ -528,6 +498,7 @@ def _(np, test_ohe_embs_df):
 @app.cell
 def _(X_test, keras, label_order_dict, np, pl, test_ohe_embs_df):
     import gc
+    from tqdm import tqdm
 
     def generate_predictions_for_aspect(aspect, model_path, X_input, protein_ids, label_list, threshold=0.01, chunk_size=5000):
         """
@@ -548,7 +519,7 @@ def _(X_test, keras, label_order_dict, np, pl, test_ohe_embs_df):
         print(f"Generating predictions for {aspect} in chunks...")
 
         # Iterate in chunks to avoid OOM
-        for start_idx in range(0, num_samples, chunk_size):
+        for start_idx in tqdm(range(0, num_samples, chunk_size)):
             end_idx = min(start_idx + chunk_size, num_samples)
 
             # Prepare batch
@@ -572,8 +543,6 @@ def _(X_test, keras, label_order_dict, np, pl, test_ohe_embs_df):
             # Clean up chunk memory
             del y_pred, _rows, _cols, _scores, X_chunk
             gc.collect()
-
-            print(f"Processed {end_idx}/{num_samples} samples")
 
         # Explicit memory cleanup
         del model
@@ -632,6 +601,47 @@ def _(X_test, keras, label_order_dict, np, pl, test_ohe_embs_df):
     print(f"Submission saved with {len(final_submission_df)} predictions.")
 
     final_submission_df
+    return
+
+
+@app.cell
+def _(input_dim, keras, output_dim):
+    import keras_tuner as kt
+
+    def build_model(hp):
+        model = keras.Sequential()
+        model.add(keras.layers.Input(shape=(input_dim,)))
+    
+        # Search over 1-3 layers
+        for i in range(hp.Int('num_layers', 1, 3)):
+            model.add(keras.layers.Dense(
+                hp.Choice(f'units_{i}', [256, 512, 1024, 2048]),
+                activation='relu'
+            ))
+        
+            # Either BN or Dropout, not both
+            if hp.Boolean('use_batchnorm'):
+                model.add(keras.layers.BatchNormalization())
+            else:
+                model.add(keras.layers.Dropout(hp.Float('dropout', 0.1, 0.5, step=0.1)))
+    
+        model.add(keras.layers.Dense(output_dim, activation='sigmoid'))
+    
+        model.compile(
+            optimizer=keras.optimizers.Adam(
+                learning_rate=hp.Choice('learning_rate', [1e-4, 5e-4, 1e-3])
+            ),
+            loss='binary_crossentropy'
+        )
+        return model
+
+    tuner = kt.BayesianOptimization(
+        build_model,
+        objective=kt.Objective('val_cafaeval_f_w', direction='max'),
+        max_trials=30,
+        directory='kt_search',
+        project_name='cafa6_aspect_c'
+    )
     return
 
 

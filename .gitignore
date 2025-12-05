@@ -22,5 +22,6 @@ swissprot_release/
 *.tsv
 taxonkit
 wandb/
+*.json
 
 

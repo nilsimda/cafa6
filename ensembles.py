@@ -1,90 +1,85 @@
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#     "marimo>=0.17.0",
+#     "pyzmq",
+# ]
+# ///
+
 import marimo
 
-__generated_with = "0.18.1"
-app = marimo.App(width="medium")
+__generated_with = "0.18.2"
+app = marimo.App()
 
 
 @app.cell
 def _():
     import marimo as mo
     import polars as pl
-    import numpy as np
     return (pl,)
 
 
 @app.cell
 def _(pl):
-    blast_preds_df = pl.read_csv("results/blast/blast_knn_maxseq10_1e-5_full.tsv", separator="\t", has_header=False).rename({"column_1": "id", "column_2": "term", "column_3": "score"})
-    esmc_preds_df = pl.read_csv("results/esmc/esmc600_knn_preds.tsv", separator="\t", has_header=False).rename({"column_1": "id", "column_2": "term", "column_3": "score"})
-    esmc_preds_df
-    return blast_preds_df, esmc_preds_df
+    foldseek_preds_df = pl.read_csv("results/foldseek_preds.tsv", separator="\t", has_header=False)
+    blast_preds_df = pl.read_csv("results/blast/blast_knn_maxseq10_1e-5_full.tsv", separator="\t", has_header=False)
+    return blast_preds_df, foldseek_preds_df
 
 
 @app.cell
-def _(blast_preds_df, esmc_preds_df, pl):
-
-    # Perform a full outer join to combine predictions from both models
-    # Missing predictions are treated as a score of 0
-    _joined_preds = blast_preds_df.join(
-        esmc_preds_df,
-        on=["id", "term"],
-        how="full",
-        suffix="_esmc"
+def _(blast_preds_df, foldseek_preds_df, pl):
+    ensemble_df = (
+        foldseek_preds_df
+        .rename({"column_1": "protein_id", "column_2": "go_term", "column_3": "foldseek_conf"})
+        .join(
+            blast_preds_df.rename({"column_1": "protein_id", "column_2": "go_term", "column_3": "blast_conf"}),
+            on=["protein_id", "go_term"],
+            how="full"
+        )
+        .with_columns([
+            pl.coalesce(["foldseek_conf", pl.lit(0)]).alias("foldseek_conf"),
+            pl.coalesce(["blast_conf", pl.lit(0)]).alias("blast_conf")
+        ])
+        .with_columns(
+            pl.max_horizontal(["foldseek_conf", "blast_conf"]).alias("confidence")
+        )
+        .select(["protein_id", "go_term", "confidence"])
     )
-
-    # Define weight for the BLAST model (0.5 implies equal weighting)
-    _blast_weight = 0.5
-
-    ensemble_df = _joined_preds.select([
-        pl.coalesce([pl.col("id"), pl.col("id_esmc")]).alias("id"),
-        pl.coalesce([pl.col("term"), pl.col("term_esmc")]).alias("term"),
-        (
-            pl.col("score").fill_null(0.0) * _blast_weight +
-            pl.col("score_esmc").fill_null(0.0) * (1 - _blast_weight)
-        ).alias("score")
-    ])
-
-    ensemble_df
     return (ensemble_df,)
 
 
 @app.cell
 def _(ensemble_df):
-    ensemble_df.write_csv("submission.tsv", include_header=False, separator="\t")
+    ensemble_df.write_csv("results/folseek_blast_max_ensemble_preds.tsv", separator="\t", include_header=False)
     return
 
 
 @app.cell
-def _(esmc_preds_df):
-    esmc_preds_df["column_1", "column_2"].n_unique()
-    return
+def _(blast_preds_df, foldseek_preds_df, pl):
+    ensemble_avg_df = (
+        foldseek_preds_df
+        .rename({"column_1": "protein_id", "column_2": "go_term", "column_3": "foldseek_conf"})
+        .join(
+            blast_preds_df.rename({"column_1": "protein_id", "column_2": "go_term", "column_3": "blast_conf"}),
+            on=["protein_id", "go_term"],
+            how="full"
+        )
+        .with_columns([
+            pl.coalesce(["foldseek_conf", pl.lit(0)]).alias("foldseek_conf"),
+            pl.coalesce(["blast_conf", pl.lit(0)]).alias("blast_conf")
+        ])
+        .with_columns(
+            ((pl.col("foldseek_conf") + pl.col("blast_conf")) / 2).alias("confidence")
+        )
+        .select(["protein_id", "go_term", "confidence"])
+    )
 
-
-app._unparsable_cell(
-    r"""
-    blast_preds_df.
-    """,
-    name="_"
-)
+    return (ensemble_avg_df,)
 
 
 @app.cell
-def _(blast_preds_df):
-    blast_preds_df["column_1", "column_2"].n_unique()
-    return
-
-
-@app.cell
-def _(blast_preds_df, esmc_preds_df, pl):
-    joined_preds = blast_preds_df.join(
-        esmc_preds_df,
-        on=["id", "term"],
-        how="full",
-        #suffix="_esmc"
-    ).with_columns(mean=pl.mean_horizontal("score", "score_right"))
-
-
-    joined_preds
+def _(ensemble_avg_df):
+    ensemble_avg_df.write_csv("results/foldseek_blast_avg_ensemble_preds.tsv", separator="\t", include_header=False)
     return
 
 
